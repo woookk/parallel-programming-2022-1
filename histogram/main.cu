@@ -10,23 +10,33 @@ DS_timer *timer;
 #define TIMER_HOST 0
 #define TIMER_KERNEL 1
 #define TIMER_KERNEL_SH 2
-#define NUM_TIMER (TIMER_KERNEL_SH + 1)
+#define TIMER_KERNEL_SH_IMPROVED 3
+#define NUM_TIMER (TIMER_KERNEL_SH_IMPROVED + 1)
 
 void sequential_Histogram(char* data, int n, int* histo);
 __global__ void histo_kernel(char* data, int n, int* histo);
 __global__ void histo_shared_kernel(char* data, int n, int* histo, int n_bins);
+__global__ void histo_improved_shared_kernel(char* data, int n, int* histo, int n_bins);
 
 void setTimer(void);
 
 int main()
 {
+    cudaError_t cudaStatus;
+    
+    cudaStatus = cudaSetDevice(0);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+        return 0;
+    }
+    
     srand((unsigned int)time(NULL));
     printf("[Histogram...]\n\n");
     
     timer = NULL;
     setTimer();
 
-    int n = 1 << 24;
+    int n = 1 << 28;
     int threads = 256;
     int blocks = 256;
     int n_bins = 7; // the number of bins, a-d, e-h, i-l, m-p, q-t, u-x, y-z
@@ -42,6 +52,7 @@ int main()
     int* h_histo_host;
     int* h_histo_kernel;
     int* h_histo_kernel_shared;
+    int* h_histo_kernel_shared_improved;
 
 
     // allocate host memory
@@ -49,6 +60,7 @@ int main()
     h_histo_host = (int*)malloc(n_bins*sizeof(int));
     h_histo_kernel = (int*)malloc(n_bins*sizeof(int));
     h_histo_kernel_shared = (int*)malloc(n_bins*sizeof(int));
+    h_histo_kernel_shared_improved = (int*)malloc(n_bins*sizeof(int));
 
     // init
     for (int i = 0; i < n; i++) {
@@ -58,6 +70,7 @@ int main()
         h_histo_host[i] = 0;
         h_histo_kernel[i] = 0;
         h_histo_kernel_shared[i] = 0;
+        h_histo_kernel_shared_improved[i] = 0;
     }
         
     // allocate device memory
@@ -82,6 +95,12 @@ int main()
             histo_shared_kernel<<<blocks, threads, smem_size>>>(d_data, n, d_histo, 7);
             cudaMemcpy(h_histo_kernel_shared, d_histo, n_bins*sizeof(int), cudaMemcpyDeviceToHost);
         timer->offTimer(TIMER_KERNEL_SH);
+    
+        timer->onTimer(TIMER_KERNEL_SH_IMPROVED);
+            smem_size = 2*n_bins*sizeof(int);
+            histo_improved_shared_kernel<<<blocks, threads, smem_size>>>(d_data, n, d_histo, 7);
+            cudaMemcpy(h_histo_kernel_shared_improved, d_histo, n_bins*sizeof(int), cudaMemcpyDeviceToHost);
+        timer->offTimer(TIMER_KERNEL_SH_IMPROVED);
 
     int total_count = 0;
     printf("histo: ");
@@ -119,16 +138,11 @@ void sequential_Histogram(char* data, int n, int* histo)
 
 __global__ void histo_kernel(char* data, int n, int* histo)
 {
-    int i = blockDim.x*blockIdx.x + threadIdx.x;
-    int section_size = (n - 1) / (blockDim.x * gridDim.x) + 1;
-    int start = i * section_size;
-
-    for (int k = 0; k < section_size; k++) {
-        if (start + k < n) {
-            int alphabet_pos = data[start + k] - 'a';
+    int tid = blockDim.x*blockIdx.x + threadIdx.x;
+    for (int i = tid; i < n; i += blockDim.x*gridDim.x) {
+            int alphabet_pos = data[i] - 'a';
             if (alphabet_pos >= 0 && alphabet_pos < 26)
                 atomicAdd(&histo[alphabet_pos/4], 1);
-        }
     }
 }
 
@@ -156,6 +170,45 @@ __global__ void histo_shared_kernel(char* data, int n, int* histo, int n_bins)
     }
 }
 
+__global__
+void histo_improved_shared_kernel(char* data, int n, int* histo, int n_bins)
+{
+    int tid = blockDim.x*blockIdx.x + threadIdx.x;
+
+    // Privatized bins
+    extern __shared__ int histo_s[];
+    if (threadIdx.x < n_bins)
+        histo_s[threadIdx.x] = 0u;
+    __syncthreads();
+
+    int prev_index = -1;
+    int accumulator = 0;
+
+    // histogram
+    for (int i = tid; i < n; i += blockDim.x*gridDim.x) {
+        int alphabet_pos = data[i] - 'a';
+        if (alphabet_pos >= 0 && alphabet_pos < 26) {
+            int curr_index = alphabet_pos/4;
+            if (curr_index != prev_index) {
+                if (prev_index != -1 && accumulator > 0)
+                    atomicAdd(&histo_s[prev_index], accumulator);
+                accumulator = 1;
+                prev_index = curr_index;
+            }
+            else {
+                accumulator++;
+            }
+        }
+    }
+    if (accumulator > 0)
+        atomicAdd(&histo_s[prev_index], accumulator);
+    __syncthreads();
+
+    // commit to global memory
+    if (threadIdx.x < n_bins) {
+        atomicAdd(&histo[threadIdx.x], histo_s[threadIdx.x]);
+    }
+}
 
 void setTimer(void) {
     timer = new DS_timer(NUM_TIMER);
@@ -163,4 +216,5 @@ void setTimer(void) {
     timer->setTimerName(TIMER_HOST, "CPU code");
     timer->setTimerName(TIMER_KERNEL, "Kernel launch");
     timer->setTimerName(TIMER_KERNEL_SH, "Kernel launch (shared memory)");
+    timer->setTimerName(TIMER_KERNEL_SH_IMPROVED, "Kernel launch (improved shared memory)");
 }
